@@ -12,6 +12,10 @@ from urllib.request import Request, urlopen
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
+# Suruga-ya監視の中核ロジック:
+# - HTTPでページを巡回して商品を収集
+# - 前回との差分から新着を判定
+# - 結果をJSONとして保存
 DEFAULT_BASE_URL = (
     "https://www.suruga-ya.jp/search"
     "?category=50108020209"
@@ -47,17 +51,20 @@ USER_AGENTS = [
 
 
 def _safe_target_id(target_id: str) -> str:
+    """ファイル名/フォルダ名に使える安全なID文字列へ変換する。"""
     cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", target_id).strip("_")
     return cleaned or DEFAULT_TARGET_ID
 
 
 def _target_dir(target_id: str) -> str:
+    """ターゲット専用ディレクトリを返す。存在しなければ作成する。"""
     path = os.path.join(TARGET_DATA_DIR, _safe_target_id(target_id))
     os.makedirs(path, exist_ok=True)
     return path
 
 
 def _target_files(target_id: str) -> dict[str, str]:
+    """ターゲット別の保存先ファイルパス群を返す。"""
     root = _target_dir(target_id)
     return {
         "saved": os.path.join(root, "saved_items.json"),
@@ -67,10 +74,17 @@ def _target_files(target_id: str) -> dict[str, str]:
 
 
 def latest_report_file(target_id: str = DEFAULT_TARGET_ID) -> str:
+    """最新レポートJSONのパスを返す。"""
     return _target_files(target_id)["latest"]
 
 
 def _load_snapshot(target_id: str = DEFAULT_TARGET_ID) -> tuple[set[str], dict[str, dict[str, str]]]:
+    """前回スナップショットを読み込む。
+
+    返り値:
+    - 既知ID集合
+    - 変更商品の詳細辞書（必要なものだけ保持）
+    """
     files = _target_files(target_id)
     source = files["saved"]
     if not os.path.exists(source):
@@ -101,6 +115,7 @@ def _save_snapshot(
     details: dict[str, dict[str, str]],
     target_id: str = DEFAULT_TARGET_ID,
 ) -> None:
+    """現在のID集合と必要詳細をコンパクト形式で保存する。"""
     payload = {
         "ids": sorted(ids),
         "details": details,
@@ -110,6 +125,7 @@ def _save_snapshot(
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 def _build_chrome_driver(headless: bool = True) -> webdriver.Chrome:
+    """Cookie取得用のChromeドライバーを生成する。"""
     options = Options()
     options.page_load_strategy = "eager"
     if headless:
@@ -121,6 +137,7 @@ def _build_chrome_driver(headless: bool = True) -> webdriver.Chrome:
 
 
 def _save_cookies(driver: webdriver.Chrome) -> None:
+    """ブラウザのCookieをJSONへ保存する。"""
     cookies = driver.get_cookies()
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:
         json.dump(cookies, f, ensure_ascii=False, indent=2)
@@ -128,6 +145,7 @@ def _save_cookies(driver: webdriver.Chrome) -> None:
 
 
 def bootstrap_login_session(open_url: str = DEFAULT_BASE_URL) -> None:
+    """手動ログインセッションを開始し、最終的にCookieを保存する。"""
     driver = _build_chrome_driver(headless=False)
     try:
         print("Browser opened.")
@@ -143,6 +161,7 @@ def bootstrap_login_session(open_url: str = DEFAULT_BASE_URL) -> None:
 
 
 def _load_cookie_header() -> str:
+    """保存済みCookie JSONをHTTPヘッダー文字列へ変換する。"""
     if not os.path.exists(COOKIE_FILE):
         return ""
     try:
@@ -161,6 +180,7 @@ def _load_cookie_header() -> str:
 
 
 def _fetch_html(url: str, cookie_header: str, user_agent: str, referer: str = "") -> str:
+    """1ページ分のHTMLをHTTP取得して文字列で返す。"""
     headers = {
         "User-Agent": user_agent,
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
@@ -179,6 +199,7 @@ def _fetch_html(url: str, cookie_header: str, user_agent: str, referer: str = ""
 
 
 def _strip_tags(text: str) -> str:
+    """HTML断片からタグを除去して可読テキストへ変換する。"""
     no_script = re.sub(r"<script.*?</script>", "", text, flags=re.I | re.S)
     no_style = re.sub(r"<style.*?</style>", "", no_script, flags=re.I | re.S)
     no_tags = re.sub(r"<[^>]+>", " ", no_style)
@@ -186,6 +207,7 @@ def _strip_tags(text: str) -> str:
 
 
 def _extract_value(tag: str, attr: str) -> str:
+    """HTMLタグ文字列から属性値を取り出す。"""
     m = re.search(rf'{attr}\s*=\s*"([^"]+)"', tag, flags=re.I)
     if m:
         return m.group(1).strip()
@@ -196,6 +218,18 @@ def _extract_value(tag: str, attr: str) -> str:
 
 
 def _extract_price(html_fragment: str, text: str) -> str:
+    """HTML断片とテキストから価格表記を抽出する。"""
+    # Sold-out text should be prioritized over any numeric fallback parsing.
+    sold_out_markers = [
+        "申し訳ございません。品切れ中です。",
+        "申し訳ございません。品切れ中です",
+        "品切れ中です",
+        "売り切れ",
+    ]
+    for marker in sold_out_markers:
+        if marker in html_fragment or marker in text:
+            return "売り切れ"
+
     # Prefer explicit price element:
     # <span class="text-price-detail price-buy">580円 (税込)</span>
     span_patterns = [
@@ -225,6 +259,7 @@ def _extract_price(html_fragment: str, text: str) -> str:
 
 
 def _extract_items_from_html(html: str, base_url: str) -> dict[str, dict[str, str]]:
+    """検索結果HTMLから商品ID単位の情報を抽出する。"""
     items: dict[str, dict[str, str]] = {}
     price_by_id: dict[str, str] = {}
 
@@ -301,6 +336,10 @@ def _extract_items_from_html(html: str, base_url: str) -> dict[str, dict[str, st
 
 
 def _build_page_url(base_url: str, page: int) -> str:
+    """指定ページ番号のURLを生成する。
+
+    既存クエリの `page` は一度除去してから付け直す。
+    """
     parts = urlsplit(base_url)
     query_items = parse_qsl(parts.query, keep_blank_values=True)
     query_items = [(k, v) for (k, v) in query_items if k.lower() != "page"]
@@ -311,6 +350,7 @@ def _build_page_url(base_url: str, page: int) -> str:
 
 
 def _get_all_items_http(base_url: str, max_pages: Optional[int] = None) -> dict[str, dict[str, str]]:
+    """HTTP巡回で複数ページの商品を最後のページまで収集する。"""
     all_items: dict[str, dict[str, str]] = {}
     page = 1
     cookie_header = _load_cookie_header()
@@ -373,6 +413,7 @@ def _get_all_items_http(base_url: str, max_pages: Optional[int] = None) -> dict[
 
 
 def get_all_items(base_url: str = DEFAULT_BASE_URL, max_pages: Optional[int] = None) -> dict[str, dict[str, str]]:
+    """商品収集の公開関数。失敗時は空辞書を返す。"""
     try:
         return _get_all_items_http(base_url=base_url, max_pages=max_pages)
     except Exception as exc:
@@ -381,6 +422,7 @@ def get_all_items(base_url: str = DEFAULT_BASE_URL, max_pages: Optional[int] = N
 
 
 def _write_report(report: dict[str, Any], target_id: str = DEFAULT_TARGET_ID) -> None:
+    """最新レポートと履歴ログ(JSONL)の両方を書き込む。"""
     files = _target_files(target_id)
     with open(files["latest"], "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
@@ -388,6 +430,7 @@ def _write_report(report: dict[str, Any], target_id: str = DEFAULT_TARGET_ID) ->
         f.write(json.dumps(report, ensure_ascii=False) + "\n")
 
 def load_latest_report(target_id: str = DEFAULT_TARGET_ID) -> dict[str, Any]:
+    """保存済みの最新レポートを読み込む。なければ初期値を返す。"""
     files = _target_files(target_id)
     if os.path.exists(files["latest"]):
         with open(files["latest"], "r", encoding="utf-8") as f:
@@ -401,6 +444,7 @@ def load_latest_report(target_id: str = DEFAULT_TARGET_ID) -> dict[str, Any]:
 
 
 def load_history(target_id: str = DEFAULT_TARGET_ID, limit: int = 30) -> list[dict[str, Any]]:
+    """履歴ログの末尾 `limit` 件を新しい順で返す。"""
     files = _target_files(target_id)
     log_file = files["log"]
     if not os.path.exists(log_file):
@@ -424,6 +468,7 @@ def check_new_items(
     base_url: str = DEFAULT_BASE_URL,
     target_id: str = DEFAULT_TARGET_ID,
 ) -> dict[str, Any]:
+    """1回分の監視チェックを実行し、新着差分を判定して保存する。"""
     old_ids, _ = _load_snapshot(target_id=target_id)
     current_items = get_all_items(base_url=base_url, max_pages=max_pages)
 

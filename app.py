@@ -1,3 +1,10 @@
+"""CLI entry point for the Suruga-ya monitor application.
+
+このファイルは「コマンド受付係」です。
+- どのコマンドを実行するかを受け取る
+- 必要な処理（監視実行、UI起動など）へ振り分ける
+"""
+
 import argparse
 import json
 import os
@@ -14,6 +21,15 @@ from scraper import (
 
 
 def parse_args() -> argparse.Namespace:
+    """コマンドライン引数を定義して解析結果を返す。
+
+    例:
+    - `init-session`: 手動ログインしてCookieを保存
+    - `check`: 1回だけ監視を実行
+    - `watch`: 監視実行後にUIを起動
+    - `show-last`: 最新レポートを表示
+    - `serve-ui`: UIサーバーのみ起動
+    """
     parser = argparse.ArgumentParser(
         description="Suruga-ya update monitor with login/adult-content session support."
     )
@@ -66,6 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """引数に応じてアプリの実行ルートを決めるメイン関数。"""
     args = parse_args()
 
     if args.command == "init-session":

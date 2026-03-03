@@ -1,10 +1,22 @@
-﻿import os
+"""監視対象URL一覧を `.env` から組み立てる設定モジュール。
+
+このファイルの役割:
+- `.env` の値を読む
+- 監視対象を `FIXED_TARGETS` 形式に整える
+"""
+
+import os
 from pathlib import Path
 
 from scraper import DEFAULT_BASE_URL
 
 
 def _read_dotenv(path: str = ".env") -> dict[str, str]:
+    """`.env` を読み取り、`{キー: 値}` の辞書にして返す。
+
+    簡易パーサーのため、`KEY=VALUE` 形式のみを対象にしている。
+    コメント行と空行は無視する。
+    """
     env_map: dict[str, str] = {}
     p = Path(path)
     if not p.exists():
@@ -29,12 +41,14 @@ _DOTENV = _read_dotenv()
 
 
 def _env(key: str, default: str = "") -> str:
+    """環境変数を優先して取得し、なければ `.env`、最後に既定値を返す。"""
     if key in os.environ and os.environ[key]:
         return os.environ[key]
     return _DOTENV.get(key, default)
 
 
 def _build_targets() -> list[dict[str, str]]:
+    """`TARGET_1..4` の設定値から監視対象リストを生成する。"""
     specs = [
         ("default", "TARGET_1_NAME", "TARGET_1_URL", "監視対象1", DEFAULT_BASE_URL),
         ("kobayashi", "TARGET_2_NAME", "TARGET_2_URL", "監視対象2", ""),
@@ -56,4 +70,5 @@ def _build_targets() -> list[dict[str, str]]:
     return targets
 
 
+# 他ファイルはこの定数だけ import すれば監視対象を利用できる。
 FIXED_TARGETS = _build_targets()

@@ -1,3 +1,11 @@
+"""ローカル監視UI(HTTPサーバー)を提供するモジュール。
+
+このファイルの役割:
+- HTML/JavaScriptを返してブラウザ画面を表示
+- APIエンドポイントで最新結果と履歴を返却
+- UIからの「全ターゲット再チェック」要求を受け付ける
+"""
+
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -124,7 +132,7 @@ HTML_PAGE = """<!doctype html>
   <div class="wrap">
     <div class="head">
       <div>
-        <div class="title">監視URL ダッシュボード</div>
+        <div class="title">駿河屋 新着チェッカー</div>
         <div class="muted">新着件数をクリックすると、下に新着商品の詳細を表示します。</div>
       </div>
       <div class="muted" id="updatedAt">読み込み中...</div>
@@ -299,7 +307,10 @@ HTML_PAGE = """<!doctype html>
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    """ダッシュボード用のHTTPリクエストハンドラ。"""
+
     def do_GET(self) -> None:
+        """GET APIとトップ画面HTMLを処理する。"""
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
 
@@ -329,6 +340,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        """POST APIを処理する（現在は全ターゲット再チェックのみ）。"""
         parsed = urlparse(self.path)
 
         if parsed.path == "/api/run-check-all":
@@ -344,9 +356,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format: str, *args) -> None:
+        """標準ログ出力を抑制する。"""
         return
 
     def _send_html(self, html: str) -> None:
+        """HTMLレスポンスを返す共通処理。"""
         payload = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -355,6 +369,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _send_json(self, payload: dict | list, status: int = 200) -> None:
+        """JSONレスポンスを返す共通処理。"""
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -365,6 +380,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def serve_dashboard(host: str = "127.0.0.1", port: int = 8080) -> None:
+    """ダッシュボードHTTPサーバーを起動する。"""
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running: http://{host}:{port}")
     print("Press Ctrl+C to stop.")
