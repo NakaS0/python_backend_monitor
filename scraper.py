@@ -6,7 +6,7 @@ from datetime import datetime
 from html import unescape
 from typing import Any, Optional
 from urllib.error import HTTPError
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from selenium import webdriver
@@ -136,6 +136,47 @@ def _build_chrome_driver(headless: bool = True) -> webdriver.Chrome:
     return webdriver.Chrome(options=options)
 
 
+def _load_cookies() -> list[dict[str, Any]]:
+    """Load cookie JSON as a list for browser fallback usage."""
+    if not os.path.exists(COOKIE_FILE):
+        return []
+    try:
+        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return []
+    return raw if isinstance(raw, list) else []
+
+
+def _apply_cookies_to_driver(driver: webdriver.Chrome, cookies: list[dict[str, Any]]) -> None:
+    """Apply cookies to opened browser, skipping malformed entries."""
+    if not cookies:
+        return
+
+    for raw in cookies:
+        name = str(raw.get("name", "")).strip()
+        value = str(raw.get("value", "")).strip()
+        if not name or not value:
+            continue
+
+        cookie_payload: dict[str, Any] = {"name": name, "value": value}
+        if raw.get("domain"):
+            cookie_payload["domain"] = raw["domain"]
+        if raw.get("path"):
+            cookie_payload["path"] = raw["path"]
+        if isinstance(raw.get("secure"), bool):
+            cookie_payload["secure"] = raw["secure"]
+        if isinstance(raw.get("httpOnly"), bool):
+            cookie_payload["httpOnly"] = raw["httpOnly"]
+        if isinstance(raw.get("expiry"), int):
+            cookie_payload["expiry"] = raw["expiry"]
+
+        try:
+            driver.add_cookie(cookie_payload)
+        except Exception:
+            continue
+
+
 def _save_cookies(driver: webdriver.Chrome) -> None:
     """ブラウザのCookieをJSONへ保存する。"""
     cookies = driver.get_cookies()
@@ -144,17 +185,39 @@ def _save_cookies(driver: webdriver.Chrome) -> None:
     print(f"Saved {len(cookies)} cookies to {COOKIE_FILE}")
 
 
-def bootstrap_login_session(open_url: str = DEFAULT_BASE_URL) -> None:
-    """手動ログインセッションを開始し、最終的にCookieを保存する。"""
+def bootstrap_login_session(
+    open_url: str = DEFAULT_BASE_URL,
+    pre_step_url: str = "https://www.suruga-ya.jp/",
+    use_pre_step: bool = True,
+) -> None:
+    """Run manual browser session bootstrap and save cookies.
+
+    Optional pre-step:
+    - open top page first
+    - let user enable adult-content visibility before login
+    """
     driver = _build_chrome_driver(headless=False)
     try:
         print("Browser opened.")
+        if use_pre_step:
+            print("Pre-step:")
+            print("1) Opened top page. Enable adult-content visibility if needed.")
+            print("2) If age/auth confirmation is shown, complete it first.")
+            print("3) Return here and press Enter to continue login step.")
+            driver.get(pre_step_url)
+            input("Press Enter to continue to login step...")
+
+        print("Login step:")
         print("1) Login to suruga-ya in the opened browser.")
-        print("2) Enable adult-content visibility.")
-        print("3) Open your target page and confirm adult items are visible.")
-        print("4) Return here and press Enter.")
+        print("2) Open your target page and confirm items are visible.")
+        print("3) Return here and press Enter to save cookies.")
         driver.get(open_url)
-        input("Press Enter after setup is complete...")
+        input("Press Enter after login step is complete...")
+
+        # Quick sanity check before saving.
+        html = driver.page_source or ""
+        visible_items = _extract_items_from_html(html, base_url=open_url)
+        print(f"Visible items on current page before save: {len(visible_items)}")
         _save_cookies(driver)
     finally:
         driver.quit()
@@ -177,6 +240,50 @@ def _load_cookie_header() -> str:
         if name and value:
             pairs.append(f"{name}={value}")
     return "; ".join(pairs)
+
+
+def _cookie_hints_from_url(base_url: str) -> dict[str, str]:
+    """Extract cookie-like hints from URL query parameters."""
+    hints: dict[str, str] = {}
+    try:
+        query_items = parse_qsl(urlsplit(base_url).query, keep_blank_values=True)
+    except Exception:
+        return hints
+
+    for key, value in query_items:
+        k = key.strip().lower()
+        v = value.strip()
+        if not v:
+            continue
+        if k == "adult_s":
+            hints["adult_s"] = v
+        elif k == "cookie":
+            hints["cookie"] = v
+    return hints
+
+
+def _merge_cookie_header(cookie_header: str, hints: dict[str, str]) -> str:
+    """Merge stored cookie header with URL-derived hints without overwriting existing values."""
+    if not hints:
+        return cookie_header
+
+    merged: dict[str, str] = {}
+    for chunk in cookie_header.split(";"):
+        part = chunk.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            continue
+        merged[name] = value
+
+    for key, value in hints.items():
+        if key not in merged:
+            merged[key] = value
+
+    return "; ".join(f"{k}={v}" for k, v in merged.items())
 
 
 def _fetch_html(url: str, cookie_header: str, user_agent: str, referer: str = "") -> str:
@@ -273,7 +380,7 @@ def _extract_items_from_html(html: str, base_url: str) -> dict[str, dict[str, st
             price_by_id[pid] = found_price
 
     anchor_pattern = re.compile(
-        r'<a\b[^>]*href\s*=\s*"([^"]*?/product/[^"]+)"[^>]*>(.*?)</a>',
+        r"<a\b[^>]*href\s*=\s*(?:\"([^\"]*?/product/[^\"]+)\"|'([^']*?/product/[^']+)')[^>]*>(.*?)</a>",
         flags=re.I | re.S,
     )
 
@@ -296,7 +403,8 @@ def _extract_items_from_html(html: str, base_url: str) -> dict[str, dict[str, st
             return nxt
         return cur
 
-    for href_raw, inner_html in anchor_pattern.findall(html):
+    for href_dq, href_sq, inner_html in anchor_pattern.findall(html):
+        href_raw = href_dq or href_sq
         href = urljoin(base_url, unescape(href_raw).strip())
         m = re.search(r"/product/[^/]+/([^/?#&]+)", href)
         if not m:
@@ -341,11 +449,25 @@ def _build_page_url(base_url: str, page: int) -> str:
     既存クエリの `page` は一度除去してから付け直す。
     """
     parts = urlsplit(base_url)
-    query_items = parse_qsl(parts.query, keep_blank_values=True)
-    query_items = [(k, v) for (k, v) in query_items if k.lower() != "page"]
+    raw_query = parts.query or ""
+    fragments = [frag for frag in raw_query.split("&") if frag]
+
+    has_page_param = False
+    kept: list[str] = []
+    for fragment in fragments:
+        key = fragment.split("=", 1)[0].strip().lower()
+        if key == "page":
+            has_page_param = True
+            continue
+        kept.append(fragment)
+
+    if page <= 1 and not has_page_param:
+        return base_url
+
     if page > 1:
-        query_items.append(("page", str(page)))
-    new_query = urlencode(query_items, doseq=True)
+        kept.append(f"page={page}")
+
+    new_query = "&".join(kept)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 
@@ -353,11 +475,15 @@ def _get_all_items_http(base_url: str, max_pages: Optional[int] = None) -> dict[
     """HTTP巡回で複数ページの商品を最後のページまで収集する。"""
     all_items: dict[str, dict[str, str]] = {}
     page = 1
-    cookie_header = _load_cookie_header()
+    stored_cookie_header = _load_cookie_header()
+    cookie_hints = _cookie_hints_from_url(base_url)
+    cookie_header = _merge_cookie_header(stored_cookie_header, cookie_hints)
     last_url = "https://www.suruga-ya.jp/"
 
-    if cookie_header:
+    if stored_cookie_header:
         print("Loaded cookies for HTTP mode.")
+    elif cookie_hints:
+        print("Cookie file not found. Using URL-derived cookie hints.")
     else:
         print("Cookie file not found for HTTP mode.")
 
@@ -412,13 +538,58 @@ def _get_all_items_http(base_url: str, max_pages: Optional[int] = None) -> dict[
     return all_items
 
 
+def _get_all_items_browser(base_url: str, max_pages: Optional[int] = None) -> dict[str, dict[str, str]]:
+    """Browser fallback crawl for URLs that fail in plain HTTP mode."""
+    all_items: dict[str, dict[str, str]] = {}
+    page = 1
+    driver = _build_chrome_driver(headless=True)
+    cookies = _load_cookies()
+
+    try:
+        # Open base domain first so cookies can be injected if present.
+        driver.get("https://www.suruga-ya.jp/")
+        _apply_cookies_to_driver(driver, cookies)
+
+        while True:
+            if max_pages is not None and page > max_pages:
+                print(f"[BROWSER] Reached max page limit: {max_pages}")
+                break
+
+            url = _build_page_url(base_url, page)
+            print(f"[BROWSER] Scanning page {page}: {url}")
+            driver.get(url)
+            time.sleep(0.8)
+            html = driver.page_source or ""
+
+            page_items = _extract_items_from_html(html, base_url=url)
+            if not page_items:
+                if page == 1:
+                    raise RuntimeError("first page returned zero items in browser mode")
+                print("[BROWSER] No product links found. Stop scanning.")
+                break
+
+            all_items.update(page_items)
+            print(f"[BROWSER] Found {len(page_items)} products on page {page}.")
+            time.sleep(PAGE_INTERVAL_SECONDS)
+            page += 1
+    finally:
+        driver.quit()
+
+    return all_items
+
+
 def get_all_items(base_url: str = DEFAULT_BASE_URL, max_pages: Optional[int] = None) -> dict[str, dict[str, str]]:
     """商品収集の公開関数。失敗時は空辞書を返す。"""
     try:
         return _get_all_items_http(base_url=base_url, max_pages=max_pages)
     except Exception as exc:
         print(f"HTTP mode failed: {exc}")
-        return {}
+        try:
+            print("Retrying in browser fallback mode...")
+            return _get_all_items_browser(base_url=base_url, max_pages=max_pages)
+        except Exception as browser_exc:
+            print(f"Browser mode failed: {browser_exc}")
+            return {}
 
 
 def _write_report(report: dict[str, Any], target_id: str = DEFAULT_TARGET_ID) -> None:

@@ -1,21 +1,16 @@
-"""監視対象URL一覧を `.env` から組み立てる設定モジュール。
-
-このファイルの役割:
-- `.env` の値を読む
-- 監視対象を `FIXED_TARGETS` 形式に整える
-"""
+"""Build monitor target list from environment variables and .env."""
 
 import os
+import re
 from pathlib import Path
 
 from scraper import DEFAULT_BASE_URL
 
 
 def _read_dotenv(path: str = ".env") -> dict[str, str]:
-    """`.env` を読み取り、`{キー: 値}` の辞書にして返す。
+    """Read .env as KEY=VALUE pairs.
 
-    簡易パーサーのため、`KEY=VALUE` 形式のみを対象にしている。
-    コメント行と空行は無視する。
+    Minimal parser by design: ignores comments and blank lines.
     """
     env_map: dict[str, str] = {}
     p = Path(path)
@@ -41,26 +36,66 @@ _DOTENV = _read_dotenv()
 
 
 def _env(key: str, default: str = "") -> str:
-    """環境変数を優先して取得し、なければ `.env`、最後に既定値を返す。"""
+    """Prefer process env, then local .env, then default."""
     if key in os.environ and os.environ[key]:
         return os.environ[key]
     return _DOTENV.get(key, default)
 
 
+LEGACY_TARGET_IDS = {
+    1: "default",
+    2: "kobayashi",
+    3: "fanza_kuji",
+    4: "shining_musume",
+}
+
+
+def _normalize_url(url: str) -> str:
+    """Apply lightweight normalization for URLs copied from editors/webpages."""
+    return url.strip().replace("&amp;", "&")
+
+
+def _target_id_for_index(index: int) -> str:
+    """Keep historical IDs for 1..4 and derive stable IDs for extra targets."""
+    return LEGACY_TARGET_IDS.get(index, f"target_{index}")
+
+
+def _collect_target_indexes() -> list[int]:
+    """Collect TARGET_<n>_URL indexes from process env and .env."""
+    pattern = re.compile(r"^TARGET_(\d+)_URL$")
+    seen: set[int] = set()
+    for key in set(_DOTENV.keys()) | set(os.environ.keys()):
+        m = pattern.match(key)
+        if not m:
+            continue
+        try:
+            seen.add(int(m.group(1)))
+        except ValueError:
+            continue
+
+    if not seen:
+        # Backward-compatible fallback when no index can be discovered.
+        return [1, 2, 3, 4]
+    return sorted(seen)
+
+
 def _build_targets() -> list[dict[str, str]]:
-    """`TARGET_1..4` の設定値から監視対象リストを生成する。"""
-    specs = [
-        ("default", "TARGET_1_NAME", "TARGET_1_URL", "監視対象1", DEFAULT_BASE_URL),
-        ("kobayashi", "TARGET_2_NAME", "TARGET_2_URL", "監視対象2", ""),
-        ("fanza_kuji", "TARGET_3_NAME", "TARGET_3_URL", "監視対象3", ""),
-        ("shining_musume", "TARGET_4_NAME", "TARGET_4_URL", "監視対象4", ""),
-    ]
+    """Build monitoring targets from TARGET_<n>_NAME / TARGET_<n>_URL pairs."""
     targets: list[dict[str, str]] = []
-    for tid, nkey, ukey, default_name, default_url in specs:
+
+    for index in _collect_target_indexes():
+        tid = _target_id_for_index(index)
+        nkey = f"TARGET_{index}_NAME"
+        ukey = f"TARGET_{index}_URL"
+
+        default_name = f"監視対象{index}"
+        default_url = DEFAULT_BASE_URL if index == 1 else ""
+
         name = _env(nkey, default_name).strip()
-        url = _env(ukey, default_url).strip()
+        url = _normalize_url(_env(ukey, default_url))
         if not url:
             continue
+
         targets.append({"id": tid, "name": name, "url": url})
 
     if not targets:
@@ -70,5 +105,5 @@ def _build_targets() -> list[dict[str, str]]:
     return targets
 
 
-# 他ファイルはこの定数だけ import すれば監視対象を利用できる。
+# Imported by app/dashboard to get active monitoring targets.
 FIXED_TARGETS = _build_targets()

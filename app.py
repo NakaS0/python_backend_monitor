@@ -9,10 +9,12 @@ import argparse
 import json
 import os
 import webbrowser
+from urllib.parse import parse_qsl, urlsplit
 
 from dashboard import serve_dashboard
 from fixed_targets import FIXED_TARGETS
 from scraper import (
+    COOKIE_FILE,
     DEFAULT_BASE_URL,
     bootstrap_login_session,
     check_new_items,
@@ -35,9 +37,14 @@ def parse_args() -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser(
+    init_parser = subparsers.add_parser(
         "init-session",
-        help="Open Chrome, login manually, enable adult content visibility, and save cookies.",
+        help="Open Chrome and create session cookies (with optional adult-setting pre-step).",
+    )
+    init_parser.add_argument(
+        "--skip-pre-step",
+        action="store_true",
+        help="Skip the pre-login step (adult visibility / age confirmation guidance).",
     )
 
     check_parser = subparsers.add_parser("check", help="Run one update check.")
@@ -81,15 +88,41 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _target_likely_requires_cookie(url: str) -> bool:
+    """Heuristic: adult/cookie query parameters usually require a session cookie."""
+    try:
+        query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    except Exception:
+        return False
+    keys = {k.lower() for k, _ in query}
+    return "adult_s" in keys or "cookie" in keys
+
+
+def _warn_cookie_if_needed() -> None:
+    """Print an actionable hint when session cookies are likely required."""
+    if os.path.exists(COOKIE_FILE):
+        return
+    if not any(_target_likely_requires_cookie(t["url"]) for t in FIXED_TARGETS):
+        return
+    print("\n[WARN] Cookie file not found: surugaya_cookies.json")
+    print("[WARN] Some configured URLs likely need a logged-in/adult-enabled session.")
+    print("[WARN] Run `python app.py init-session` and then retry `python app.py check`.\n")
+
+
 def main() -> None:
     """引数に応じてアプリの実行ルートを決めるメイン関数。"""
     args = parse_args()
 
     if args.command == "init-session":
-        bootstrap_login_session(open_url=DEFAULT_BASE_URL)
+        open_url = FIXED_TARGETS[0]["url"] if FIXED_TARGETS else DEFAULT_BASE_URL
+        bootstrap_login_session(
+            open_url=open_url,
+            use_pre_step=not args.skip_pre_step,
+        )
         return
 
     if args.command == "check":
+        _warn_cookie_if_needed()
         for target in FIXED_TARGETS:
             print(f"\n=== Target: {target['name']} ({target['id']}) ===")
             check_new_items(
@@ -100,6 +133,7 @@ def main() -> None:
         return
 
     if args.command == "watch":
+        _warn_cookie_if_needed()
         for target in FIXED_TARGETS:
             print(f"\n=== Target: {target['name']} ({target['id']}) ===")
             check_new_items(

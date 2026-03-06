@@ -41,10 +41,15 @@ python app.py init-session
 
 Chrome が開いたら:
 
-1. 駿河屋へログイン
-2. 成人向け表示を有効化
-3. 対象ページで表示を確認
-4. ターミナルに戻って Enter
+1. 前段階でトップページを開き、年齢確認/成人向け表示設定を完了
+2. 対象ページへ遷移後にログインし、表示を確認
+3. ターミナルに戻って Enter（Cookie保存）
+
+前段階をスキップしたい場合:
+
+```bash
+python app.py init-session --skip-pre-step
+```
 
 Cookieは `surugaya_cookies.json` に保存されます。
 
